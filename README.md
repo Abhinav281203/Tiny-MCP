@@ -22,16 +22,16 @@ MCP try/
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Ollama installed and running locally
 - At least one Ollama model downloaded (e.g., `llama3.1:8b`)
 
-## 🛠️ Installation
+## Installation
 
 1. **Clone the repository**:
    ```bash
    git clone <repository-url>
-   cd "MCP try"
+   cd "Tiny-MCP"
    ```
 
 2. **Install dependencies**:
