@@ -1,6 +1,7 @@
-import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import traceback
+from contextlib import AsyncExitStack
+from typing import Optional
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -16,207 +17,173 @@ logging.basicConfig(
 
 
 class MCPClient:
-    def __init__(self, server_url="http://localhost:8000/sse"):
+    def __init__(self, model, server_url="http://0.0.0.0:8000/sse"):
+        self.model = model
+        self.server_url = server_url
+        self.session: Optional[ClientSession] = None
+        self.exit_stack = AsyncExitStack()
+        self.llm = OllamaClient(model=model)
+        self.tools = []
+        self.messages = []
+        self.headers = {}
+        self.logger = logging.getLogger(__name__)
+
+    # connect to the MCP server via SSE
+    async def connect_to_server(self):
         try:
-            self.server_url = server_url
-            self.session = None
-            self.sse_context = None
-            self._connected = False
-            logging.info(f"MCPClient initialized with server URL: {server_url}")
-        except Exception as e:
-            logging.error(f"Error initializing MCPClient: {e}")
-            raise
+            params = {
+                "url": self.server_url,
+                "headers": self.headers or {},
+                "timeout": 5.0,
+                "sse_read_timeout": 300.0,
+            }
 
-    async def connect(self):
-        if self._connected:
-            return
+            client_stream = await self.exit_stack.enter_async_context(
+                sse_client(**params)
+            )
+            self.session = await self.exit_stack.enter_async_context(
+                ClientSession(*client_stream)
+            )
 
-        try:
-            self.sse_context = sse_client(self.server_url)
-            self.read_stream, self.write_stream = await self.sse_context.__aenter__()
-
-            self.session = ClientSession(self.read_stream, self.write_stream)
-            await self.session.__aenter__()
             await self.session.initialize()
+            self.logger.info("Connected to MCP server via SSE")
 
-            self._connected = True
-        except Exception as e:
-            logging.error(f"Error connecting to MCP server: {e}")
-            self._connected = False
-            raise
+            mcp_tools = await self.get_mcp_tools()
+            self.tools = ollama_tool_parser(mcp_tools)
 
-    async def disconnect(self):
-        if not self._connected:
-            return
-
-        await self.session.__aexit__(None, None, None)
-        await self.sse_context.__aexit__(None, None, None)
-        self.session = None
-        self.sse_context = None
-        self._connected = False
-
-    async def get_tools(self) -> ListToolsResult:
-        try:
-            if not self._connected:
-                raise RuntimeError("Not connected")
-
-            tools = await self.session.list_tools()
-            logging.info(
-                f"Successfully retrieved {len(tools.tools)} tools from MCP server"
+            self.logger.info(
+                f"Available tools: {[tool.function.name for tool in self.tools]}"
             )
-            return tools
+            return True
+
         except Exception as e:
-            logging.error(f"Error getting tools from MCP server: {e}")
+            self.logger.error(f"Error connecting to MCP server: {e}")
+            traceback.print_exc()
             raise
 
-    async def call_tool(self, tool_name, arguments) -> CallToolResult:
+    # get MCP tool list
+    async def get_mcp_tools(self):
         try:
-            if not self._connected:
-                raise RuntimeError("Not connected")
-
-            logging.info(f"Calling tool `{tool_name}` with args {arguments}")
-            result = await self.session.call_tool(name=tool_name, arguments=arguments)
-            return result
+            response: ListToolsResult = await self.session.list_tools()
+            return response.tools
         except Exception as e:
-            logging.error(f"Error calling tool `{tool_name}`: {e}")
+            self.logger.error(f"Error getting MCP tools: {e}")
             raise
 
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, *args):
-        await self.disconnect()
-
-
-class Client:
-    def __init__(
-        self,
-        model: str,
-        server_url: str = "http://localhost:8000/sse",
-    ):
+    # process query
+    async def process_query(self, query: str):
         try:
-            self.model = model
-            self.mcp_client = MCPClient(server_url)
-            self.ollama_client = OllamaClient(model=self.model)
-            self.messages: List[Dict[str, str]] = []
-            self.available_tools: Optional[List[Dict]] = None
-            self._tool_lock = asyncio.Lock()
-            logging.info(
-                f"Client initialized with model: {model}, server_url: {server_url}"
+            self.logger.info(f"Processing query: {query}")
+            self.messages.append({"role": "user", "content": query})
+
+            while True:
+                response = await self.call_llm()
+
+                # simple text response
+                if response.message.content and not response.message.tool_calls:
+                    self.logger.info(f"LLM gave text response. Stopping!")
+                    self.messages.append(
+                        {"role": "assistant", "content": response.message.content}
+                    )
+                    break
+
+                # tool call response
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response.message.content or "",
+                }
+                if response.message.tool_calls:
+                    self.logger.info(f"LLM gave Tool call!")
+
+                    assistant_message["tool_calls"] = [
+                        {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        for i, tool_call in enumerate(response.message.tool_calls)
+                    ]
+
+                    self.messages.append(assistant_message)
+
+                    for i, tool_call in enumerate(response.message.tool_calls):
+                        try:
+                            self.logger.info(f"Calling tool {tool_call.function.name}")
+                            result: CallToolResult = await self.session.call_tool(
+                                name=tool_call.function.name,
+                                arguments=tool_call.function.arguments,
+                            )
+                            self.logger.info(
+                                f"Tool {tool_call.function.name} - result: {result}..."
+                            )
+
+                            # Add tool result to messages
+                            tool_content = result.structuredContent["result"]
+                            # Ensure content is a string
+                            if not isinstance(tool_content, str):
+                                tool_content = str(tool_content)
+
+                            self.messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": f"call_{i}",
+                                    "content": tool_content,
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error calling tool {tool_call.function.name}: {e}"
+                            )
+                            raise
+
+            return self.messages
+
+        except Exception as e:
+            self.logger.error(f"Error processing query: {e}")
+            raise
+
+    # call LLM
+    async def call_llm(self) -> ChatResponse:
+        try:
+            self.logger.info("Calling LLM")
+            response: ChatResponse = self.llm.chat(
+                messages=self.messages, tools=self.tools
             )
+            return response
         except Exception as e:
-            logging.error(f"Error initializing Client: {e}")
+            self.logger.error(f"Error calling LLM: {e}")
             raise
 
-    async def ensure_connected(self):
-        """
-        Ensure connection and tool list are available (thread-safe).
-        """
+    # cleanup
+    async def cleanup(self):
         try:
-            async with self._tool_lock:
-                if self.available_tools is None:
-                    await self.mcp_client.connect()
-                    tools = await self.mcp_client.get_tools()
-                    self.available_tools = ollama_tool_parser(tools.tools)
+            await self.exit_stack.aclose()
+            self.logger.info("Disconnected from MCP server")
         except Exception as e:
-            logging.error(f"Error ensuring connection: {e}")
-            raise
-
-    async def chat(
-        self, user_query: str, temperature: float = 0.0, role: str = "user"
-    ) -> Optional[str]:
-        """
-        Send a chat message and handle response.
-        """
-        try:
-            await self.ensure_connected()
-            self.messages.append({"role": role, "content": user_query})
-
-            logging.info("Processing user query.")
-            response: ChatResponse = self.ollama_client.chat(
-                messages=self.messages,
-                tools=self.available_tools,
-                temperature=temperature,
-            )
-
-            result = await self._handle_response(response)
-            return result
-        except Exception as e:
-            logging.error(f"Error in chat method: {e}")
-            raise
-        finally:
-            await self.mcp_client.disconnect()
-
-    async def _handle_response(self, response: ChatResponse, role: str = "assistant") -> Optional[str]:
-        try:
-            content = None
-
-            if response.message.role == "tool" or response.message.tool_calls:
-                logging.info("Response contains tool calls")
-                content = await self._handle_tool_calls(response.message.tool_calls)
-                content = content.content[0].text
-
-            elif response.message.role == "assistant":
-                logging.info("Response is from assistant")
-                content = response.message.content
-
-            if content is not None:
-                self.messages.append({"role": role, "content": content})
-            return content
-
-        except Exception as e:
-            logging.error(f"Error handling response: {e}")
-            raise
-
-    async def _handle_tool_calls(self, tool_calls) -> CallToolResult:
-        """
-        Execute all tool calls from Ollama.
-        """
-        try:
-            await self.ensure_connected()
-            call = tool_calls[0]
-
-            call_name = call.function.name
-            call_args = call.function.arguments
-
-            tool_result = None
-
-            async with self._tool_lock:
-                await self.mcp_client.connect()
-                tool_result = await self.mcp_client.call_tool(
-                    tool_name=call_name, arguments=call_args
-                )
-
-            if tool_result.isError:
-                logging.error(f"Error executing tool {call_name}: {tool_result.content}")
-                raise RuntimeError(f"Tool execution failed: {tool_result.content}")
-            else:
-                logging.info(f"Successfully executed tool {call_name}")
-                return tool_result
-
-        except Exception as e:
-            logging.error(f"Error calling tool {call_name}: {e}")
+            self.logger.error(f"Error during cleanup: {e}")
+            traceback.print_exc()
             raise
 
 
 async def main():
-    try:
-        client = Client(model="llama3.2:latest")
-        try:
-            reply = await client.chat("Hi, what is sum of -87 and 23?")
-            if reply:
-                logging.info(f"Client response: {reply}")
+    c = MCPClient(model="llama3.2:latest")
+    await c.connect_to_server()
+    await c.process_query("Add 23 n 2345543")
 
-            reply = await client.chat("hi, then what is it when added 10?")
-            if reply:
-                logging.info(f"Client response: {reply}")
-        finally:
-            await client.disconnect()
-    except Exception as e:
-        logging.error(f"Error in main function: {e}")
-        raise
+    for m in c.messages:
+
+        for k, v in m.items():
+            print(f"{k} - {v}")
+
+        print()
+
+    await c.cleanup()
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())

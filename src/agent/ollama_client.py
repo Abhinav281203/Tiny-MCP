@@ -1,10 +1,10 @@
 import logging
-import requests
 from typing import Dict, List, Optional
-import json
+
+import requests
+from ollama import ChatResponse
 
 from schemas import OllamaTool
-from ollama import ChatResponse
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
